@@ -1,0 +1,353 @@
+--- a/vesc/vesc_ackermann/include/vesc_ackermann/ackermann_to_vesc.hpp
++++ b/vesc/vesc_ackermann/include/vesc_ackermann/ackermann_to_vesc.hpp
+@@ -34,6 +34,7 @@
+ #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
+ #include <rclcpp/rclcpp.hpp>
+ #include <std_msgs/msg/float64.hpp>
++#include <vesc_msgs/msg/vesc_state_stamped.hpp>
+ 
+ namespace vesc_ackermann
+ {
+@@ -53,15 +54,41 @@
+   double steering_to_servo_gain_, steering_to_servo_offset_;
+   double wheelbase_;
+ 
++  // Optional, bounded regenerative motor braking.  A brake packet and a
++  // speed packet select different VESC control modes, so this node is the
++  // single owner of both and emits exactly one motor command per drive input.
++  bool enable_motor_brake_, braking_;
++  double vesc_state_speed_to_erpm_gain_;
++  double brake_accel_engage_, brake_accel_release_;
++  double brake_speed_error_engage_, brake_speed_error_release_;
++  double brake_min_speed_, brake_release_speed_;
++  double brake_current_min_, brake_current_max_;
++  double brake_current_per_mps2_, brake_current_per_mps_;
++  double brake_current_rise_rate_, brake_current_fall_rate_;
++  double brake_steering_derate_, brake_steering_reference_;
++  double brake_max_input_voltage_, brake_resume_input_voltage_;
++  double brake_state_timeout_, brake_command_timeout_;
++  double measured_speed_, input_voltage_, last_brake_current_;
++  bool have_vesc_state_;
++  rclcpp::Time last_vesc_state_time_, last_command_time_, last_motor_command_time_;
++
+   /** @todo consider also providing an interpolated look-up table conversion */
+ 
+   // ROS services
+   rclcpp::Publisher<Float64>::SharedPtr erpm_pub_;
++  rclcpp::Publisher<Float64>::SharedPtr brake_pub_;
+   rclcpp::Publisher<Float64>::SharedPtr servo_pub_;
+   rclcpp::Subscription<AckermannDriveStamped>::SharedPtr ackermann_sub_;
++  rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
++  rclcpp::TimerBase::SharedPtr watchdog_timer_;
+ 
+   // ROS callbacks
+   void ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd);
++  void vescStateCallback(const vesc_msgs::msg::VescStateStamped::SharedPtr state);
++  void watchdogCallback();
++
++  bool brakeRequested(const AckermannDriveStamped & cmd, double state_age) const;
++  double brakeCurrent(const AckermannDriveStamped & cmd, double dt) const;
+ };
+ 
+ }  // namespace vesc_ackermann
+--- a/vesc/vesc_ackermann/src/ackermann_to_vesc.cpp
++++ b/vesc/vesc_ackermann/src/ackermann_to_vesc.cpp
+@@ -32,9 +32,14 @@
+ 
+ #include <ackermann_msgs/msg/ackermann_drive_stamped.hpp>
+ #include <std_msgs/msg/float64.hpp>
++#include <vesc_msgs/msg/vesc_state_stamped.hpp>
+ 
++#include <algorithm>
++#include <chrono>
+ #include <cmath>
++#include <limits>
+ #include <sstream>
++#include <stdexcept>
+ #include <string>
+ 
+ namespace vesc_ackermann
+@@ -43,9 +48,20 @@
+ using ackermann_msgs::msg::AckermannDriveStamped;
+ using std::placeholders::_1;
+ using std_msgs::msg::Float64;
++using vesc_msgs::msg::VescStateStamped;
++
++using namespace std::chrono_literals;
+ 
+ AckermannToVesc::AckermannToVesc(const rclcpp::NodeOptions & options)
+-: Node("ackermann_to_vesc_node", options)
++: Node("ackermann_to_vesc_node", options),
++  braking_(false),
++  measured_speed_(0.0),
++  input_voltage_(0.0),
++  last_brake_current_(0.0),
++  have_vesc_state_(false),
++  last_vesc_state_time_(0, 0, RCL_ROS_TIME),
++  last_command_time_(0, 0, RCL_ROS_TIME),
++  last_motor_command_time_(0, 0, RCL_ROS_TIME)
+ {
+   // get conversion parameters
+   speed_to_erpm_gain_ = this->declare_parameter<double>("speed_to_erpm_gain", 1.0);
+@@ -53,17 +69,151 @@
+   steering_to_servo_gain_ = this->declare_parameter<double>("steering_angle_to_servo_gain", 1.0);
+   steering_to_servo_offset_ = this->declare_parameter<double>("steering_angle_to_servo_offset", 0.0);
+   wheelbase_ = this->declare_parameter<double>("wheelbase", 1.0);
++
++  enable_motor_brake_ = declare_parameter<bool>("enable_motor_brake", false);
++  vesc_state_speed_to_erpm_gain_ = declare_parameter<double>(
++    "vesc_state_speed_to_erpm_gain", std::abs(speed_to_erpm_gain_));
++  brake_accel_engage_ = declare_parameter<double>("brake_accel_engage", -1.0);
++  brake_accel_release_ = declare_parameter<double>("brake_accel_release", -0.25);
++  brake_speed_error_engage_ = std::max(
++    0.0, declare_parameter<double>("brake_speed_error_engage", 0.15));
++  brake_speed_error_release_ = std::max(
++    0.0, declare_parameter<double>("brake_speed_error_release", 0.05));
++  brake_min_speed_ = std::max(0.0, declare_parameter<double>("brake_min_speed", 0.50));
++  brake_release_speed_ = std::max(
++    0.0, declare_parameter<double>("brake_release_speed", 0.30));
++  brake_current_min_ = std::max(
++    0.0, declare_parameter<double>("brake_current_min", 3.0));
++  brake_current_max_ = std::max(
++    brake_current_min_, declare_parameter<double>("brake_current_max", 12.0));
++  brake_current_per_mps2_ = std::max(
++    0.0, declare_parameter<double>("brake_current_per_mps2", 1.3));
++  brake_current_per_mps_ = std::max(
++    0.0, declare_parameter<double>("brake_current_per_mps", 2.0));
++  brake_current_rise_rate_ = std::max(
++    0.0, declare_parameter<double>("brake_current_rise_rate", 80.0));
++  brake_current_fall_rate_ = std::max(
++    0.0, declare_parameter<double>("brake_current_fall_rate", 120.0));
++  brake_steering_derate_ = std::max(
++    0.0, std::min(1.0, declare_parameter<double>("brake_steering_derate", 0.35)));
++  brake_steering_reference_ = std::max(
++    1e-3, declare_parameter<double>("brake_steering_reference", 0.25));
++  brake_max_input_voltage_ = std::max(
++    0.0, declare_parameter<double>("brake_max_input_voltage", 0.0));
++  brake_resume_input_voltage_ = std::max(
++    0.0, declare_parameter<double>("brake_resume_input_voltage", 0.0));
++  brake_state_timeout_ = std::max(
++    0.02, declare_parameter<double>("brake_state_timeout", 0.15));
++  brake_command_timeout_ = std::max(
++    0.02, declare_parameter<double>("brake_command_timeout", 0.20));
++
++  if (std::abs(vesc_state_speed_to_erpm_gain_) < 1e-6) {
++    throw std::invalid_argument("vesc_state_speed_to_erpm_gain must be non-zero");
++  }
++  if (brake_accel_release_ <= brake_accel_engage_) {
++    throw std::invalid_argument("brake_accel_release must be greater than brake_accel_engage");
++  }
++  if (brake_speed_error_release_ >= brake_speed_error_engage_) {
++    throw std::invalid_argument(
++            "brake_speed_error_release must be less than brake_speed_error_engage");
++  }
++  if (brake_release_speed_ >= brake_min_speed_) {
++    throw std::invalid_argument("brake_release_speed must be less than brake_min_speed");
++  }
++  if (brake_max_input_voltage_ > 0.0 &&
++    brake_resume_input_voltage_ >= brake_max_input_voltage_)
++  {
++    throw std::invalid_argument("brake_resume_input_voltage must be below brake_max_input_voltage");
++  }
+   // create publishers to vesc electric-RPM (speed) and servo commands
+   erpm_pub_ = create_publisher<Float64>("commands/motor/speed", 10);
++  brake_pub_ = create_publisher<Float64>("commands/motor/brake", 10);
+   servo_pub_ = create_publisher<Float64>("commands/servo/position", 10);
+ 
+   // subscribe to ackermann topic
+   ackermann_sub_ = create_subscription<AckermannDriveStamped>(
+     "ackermann_cmd", 10, std::bind(&AckermannToVesc::ackermannCmdCallback, this, _1));
++  vesc_state_sub_ = create_subscription<VescStateStamped>(
++    "sensors/core", 10, std::bind(&AckermannToVesc::vescStateCallback, this, _1));
++  watchdog_timer_ = create_wall_timer(20ms, std::bind(&AckermannToVesc::watchdogCallback, this));
++
++  RCLCPP_INFO(
++    get_logger(), "motor brake %s (%.1f..%.1f A, engage a<=%.2f m/s^2)",
++    enable_motor_brake_ ? "enabled" : "disabled", brake_current_min_, brake_current_max_,
++    brake_accel_engage_);
++}
++
++void AckermannToVesc::vescStateCallback(const VescStateStamped::SharedPtr state)
++{
++  measured_speed_ =
++    (state->state.speed - speed_to_erpm_offset_) / vesc_state_speed_to_erpm_gain_;
++  input_voltage_ = state->state.voltage_input;
++  have_vesc_state_ = std::isfinite(measured_speed_) && std::isfinite(input_voltage_);
++  last_vesc_state_time_ = now();
++}
++
++bool AckermannToVesc::brakeRequested(
++  const AckermannDriveStamped & cmd, const double state_age) const
++{
++  if (!enable_motor_brake_ || !have_vesc_state_ || state_age > brake_state_timeout_) {
++    return false;
++  }
++  // This race stack only drives forward.  Refuse regenerative braking for a
++  // reverse/stale-sign command rather than applying an unvalidated torque.
++  if (cmd.drive.speed < 0.0 || measured_speed_ <= 0.0) {
++    return false;
++  }
++  const double voltage_limit = braking_ ?
++    brake_max_input_voltage_ : brake_resume_input_voltage_;
++  if (voltage_limit > 0.0 && input_voltage_ >= voltage_limit) {
++    return false;
++  }
++
++  const double speed_error = measured_speed_ - cmd.drive.speed;
++  if (!braking_) {
++    return cmd.drive.acceleration <= brake_accel_engage_ &&
++           measured_speed_ >= brake_min_speed_ &&
++           speed_error >= brake_speed_error_engage_;
++  }
++  return cmd.drive.acceleration <= brake_accel_release_ &&
++         measured_speed_ >= brake_release_speed_ &&
++         speed_error >= brake_speed_error_release_;
++}
++
++double AckermannToVesc::brakeCurrent(
++  const AckermannDriveStamped & cmd, const double dt) const
++{
++  const double extra_deceleration = std::max(
++    0.0, -cmd.drive.acceleration - std::abs(brake_accel_engage_));
++  const double extra_speed_error = std::max(
++    0.0, measured_speed_ - cmd.drive.speed - brake_speed_error_engage_);
++  double target = brake_current_min_ +
++    brake_current_per_mps2_ * extra_deceleration +
++    brake_current_per_mps_ * extra_speed_error;
++
++  // Rear motor braking at full lock can consume too much of the tyre's force
++  // budget.  Reduce it smoothly, but never change its sign.
++  const double steering_fraction = std::min(
++    1.0, std::abs(cmd.drive.steering_angle) / brake_steering_reference_);
++  target *= 1.0 - brake_steering_derate_ * steering_fraction;
++  target = std::max(0.0, std::min(brake_current_max_, target));
++
++  const double rise = brake_current_rise_rate_ * dt;
++  const double fall = brake_current_fall_rate_ * dt;
++  return std::max(
++    last_brake_current_ - fall, std::min(last_brake_current_ + rise, target));
+ }
+ 
+ void AckermannToVesc::ackermannCmdCallback(const AckermannDriveStamped::SharedPtr cmd)
+ {
++  const rclcpp::Time stamp = now();
++  const double state_age = have_vesc_state_ ?
++    std::max(0.0, (stamp - last_vesc_state_time_).seconds()) :
++    std::numeric_limits<double>::infinity();
++  const double motor_dt = last_motor_command_time_.nanoseconds() == 0 ? 0.04 :
++    std::max(0.0, std::min(0.10, (stamp - last_motor_command_time_).seconds()));
++  const bool next_braking = brakeRequested(*cmd, state_age);
++
+   // calc vesc electric RPM (speed)
+   Float64 erpm_msg;
+   erpm_msg.data = speed_to_erpm_gain_ * cmd->drive.speed + speed_to_erpm_offset_;
+@@ -74,9 +224,59 @@
+ 
+   // publish
+   if (rclcpp::ok()) {
+-    erpm_pub_->publish(erpm_msg);
++    if (next_braking) {
++      Float64 brake_msg;
++      last_brake_current_ = brakeCurrent(*cmd, motor_dt);
++      // Apply the configured minimum immediately on entry; after that the
++      // current is slew-limited at every Ackermann update.
++      if (!braking_) {
++        const double corner_scale = 1.0 - brake_steering_derate_ * std::min(
++          1.0, std::abs(cmd->drive.steering_angle) / brake_steering_reference_);
++        last_brake_current_ = std::max(
++          last_brake_current_, brake_current_min_ * corner_scale);
++        RCLCPP_INFO(
++          get_logger(), "motor brake engaged: speed %.2f -> %.2f m/s, a %.2f, %.1f A",
++          measured_speed_, cmd->drive.speed, cmd->drive.acceleration, last_brake_current_);
++      }
++      brake_msg.data = last_brake_current_;
++      brake_pub_->publish(brake_msg);
++    } else {
++      if (braking_) {
++        RCLCPP_INFO(
++          get_logger(), "motor brake released: speed %.2f -> %.2f m/s",
++          measured_speed_, cmd->drive.speed);
++      }
++      last_brake_current_ = 0.0;
++      erpm_pub_->publish(erpm_msg);
++    }
+     servo_pub_->publish(servo_msg);
+   }
++  braking_ = next_braking;
++  last_command_time_ = stamp;
++  last_motor_command_time_ = stamp;
++}
++
++void AckermannToVesc::watchdogCallback()
++{
++  if (last_command_time_.nanoseconds() == 0) {
++    return;
++  }
++  if ((now() - last_command_time_).seconds() <= brake_command_timeout_) {
++    return;
++  }
++
++  // Override either a latched ERPM target or a latched current-brake target
++  // when the mux/controller stream disappears.  A zero-current brake packet
++  // selects coast without an abrupt rear-axle torque step; a later valid
++  // drive message selects speed mode or a freshly checked braking current.
++  Float64 release_msg;
++  release_msg.data = 0.0;
++  brake_pub_->publish(release_msg);
++  braking_ = false;
++  last_brake_current_ = 0.0;
++  last_motor_command_time_ = now();
++  last_command_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
++  RCLCPP_WARN(get_logger(), "motor watchdog forced coast after stale command");
+ }
+ 
+ }  // namespace vesc_ackermann
+--- a/f1tenth_stack/config/vesc.yaml
++++ b/f1tenth_stack/config/vesc.yaml
+@@ -21,8 +21,10 @@
+     duty_cycle_max: 0.0
+     current_min: 0.0
+     current_max: 100.0
+-    brake_min: -20000.0
+-    brake_max: 200000.0
++    # VESC setBrake() is motor current in amperes.  Keep the ROS-side clamp
++    # physically bounded even if another publisher is accidentally started.
++    brake_min: 0.0
++    brake_max: 12.0
+     # Requested 10.0 m/s ceiling: 10.0 * 6700 ERPM/(m/s) = 67000 ERPM.
+     speed_min: -67000.0
+     speed_max: 67000.0
+@@ -31,6 +33,33 @@
+     servo_min: 0.15
+     servo_max: 0.85
+ 
++    # Apply regenerative current only when fresh VESC telemetry confirms the
++    # car is moving faster than the final muxed Ackermann target.  Speed and
++    # brake are mutually exclusive inside ackermann_to_vesc_node.
++    enable_motor_brake: true
++    vesc_state_speed_to_erpm_gain: 6700.0
++    brake_accel_engage: -1.0
++    brake_accel_release: -0.25
++    brake_speed_error_engage: 0.15
++    brake_speed_error_release: 0.05
++    brake_min_speed: 0.50
++    brake_release_speed: 0.30
++    brake_current_min: 3.0
++    brake_current_max: 12.0
++    brake_current_per_mps2: 1.3
++    brake_current_per_mps: 2.0
++    brake_current_rise_rate: 80.0
++    brake_current_fall_rate: 120.0
++    # Reduce rear-axle braking up to 35% at full steering lock to preserve
++    # lateral grip.  The latest bag is a 3S pack (11.5-11.7 V); stop explicit
++    # regen near the 12.6 V full-charge ceiling.
++    brake_steering_derate: 0.35
++    brake_steering_reference: 0.25
++    brake_max_input_voltage: 12.4
++    brake_resume_input_voltage: 12.2
++    brake_state_timeout: 0.15
++    brake_command_timeout: 0.20
++
+ # No longer needed, all parameters are shared
+ # ackermann_to_vesc_node:
+ #   ros__parameters:

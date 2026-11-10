@@ -1,0 +1,27 @@
+# Simulator-plant facts only.
+#
+# Controller tuning is NOT duplicated here any more: run_sim.sh generates the
+# parameter file from run_car.sh with tools/sim_overrides.py, so the simulator
+# always drives the same controller the car does and cannot silently drift out
+# of sync.  This file holds the handful of numbers that describe the *plant*
+# f1tenth_gym_ros presents, and it is loaded before the generated file.
+#
+# Vehicle parameters are matched to the car on the simulator side instead -
+# see VEHICLE_PARAM_OVERRIDES in launch/sim_mpc_launch.py (grip mu 0.612 =
+# 6.0 m/s^2, wheel travel -0.438/+0.466 rad, servo slew 4.02 rad/s).
+mpc_controller:
+  ros__parameters:
+    # config/sim.yaml: lidar_base_link_to_lidar_tf [0.275, 0, 0].
+    laser_offset: 0.275
+    # The scan is synthetic and noise is a clean 1 cm Gaussian, so the wall
+    # filter does not need the car's margin against reflective clutter.  Left
+    # at the car's value by the generated file; override here only for
+    # obstacle-detection experiments.
+
+    # Known plant differences from the car, for the record:
+    #   * gym's steering actuator is a pure rate limit (no first-order lag),
+    #     while the servo adds steering_time_constant 0.17 s.  Sim response is
+    #     therefore slightly crisper than the car's.
+    #   * localisation is exact: no particle-filter noise or latency.
+    #   * the tyre model is single-track with linear cornering stiffness, so
+    #     it does not reproduce the car's understeer growth near the limit.

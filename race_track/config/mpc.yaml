@@ -1,0 +1,292 @@
+mpc_controller:
+  ros__parameters:
+    # Launch files and the real-car runner select the map and raceline.
+    odom_topic: /ego_racecar/odom
+    drive_topic: /drive
+    scan_topic: /scan
+    frame_id: map
+
+    # RViz speed-only editing (Interactive Markers on /mpc/raceline_editor).
+    # Handles are fixed in map X/Y and move only vertically; height represents
+    # the authored vx value. Each edit blends over a tight neighbourhood and
+    # rebuilds ax, while s/x/y/heading/curvature remain exactly unchanged.
+    # A handle every 2 points is about 0.2 m spacing on the active line.
+    raceline_editor_control_stride: 2
+    raceline_editor_influence_points: 6
+    raceline_editor_marker_scale: 0.16
+    raceline_editor_speed_height_scale: 0.10
+    raceline_editor_speed_step: 0.5
+
+    # VESC IMU fusion (enable_imu is set by run_car.sh; the simulator has no
+    # IMU topic).  The driver's /sensors/imu/raw is sensor_msgs/Imu in SI
+    # units: acceleration is m/s^2 and angular velocity is rad/s.  Axis mapping
+    # identified from bag mpc_20260722 (tools/imu_axis_calibration.py):
+    # vehicle yaw rate = +gyr_z (corr 0.98), longitudinal accel = -acc_y,
+    # lateral accel = +acc_x; stationary gyro-z bias is estimated out whenever
+    # the car sits still for ~0.4 s.
+    imu_topic: /sensors/imu/raw
+    imu_accel_in_g: false
+    imu_gyro_in_degrees: false
+    imu_yaw_rate_axis: z
+    imu_long_accel_axis: -y
+    imu_lat_accel_axis: x
+    # 50 Hz samples with motor/gear vibration: 8 Hz first-order low-pass.
+    imu_lpf_cutoff: 8.0
+    imu_timeout: 0.3
+    # What the IMU feeds when enabled: measured yaw-rate/accel latency
+    # propagation, scan-timestamp pose alignment for the wall filter, and
+    # ERPM speed fusion (~0.4 s complementary time constant rides through
+    # brief wheel slip/lock without accumulating integration drift).
+    imu_use_latency_compensation: true
+    imu_use_scan_alignment: true
+    imu_use_speed_fusion: true
+    imu_speed_fusion_time_constant: 0.4
+    # Stop open-loop accel integration if odometry is absent this long.  The
+    # fused estimate still rides through bad ERPM values while messages arrive;
+    # this guard only prevents accelerometer bias from running away on dropout.
+    imu_speed_hold_time: 0.15
+    # Independent safety layer.  Spin = measured yaw rate off the commanded
+    # kinematic yaw rate for >0.2 s above 1.5 m/s; the command runs through a
+    # 0.17 s first-order lag (servo + chassis response) before comparison.
+    # Thresholds replay-tuned on bags mpc_20260723_171549 + 175903: without
+    # the lag normal corner entry hits 3.5 rad/s residual; with it clean
+    # driving stays under 2.3 (autonomous-window p95 1.15), so 2.5 gives
+    # zero false stops while catching the real obstacle-contact skid in
+    # 175903 (residual -3.15) 1.4 s before the driver's takeover.
+    # Collision = unfiltered |accel| above 19 m/s^2: clean fast laps peak at
+    # 13.5-18.0 while the measured contact spiked to 19.9-20.8; latched 1 s.
+    enable_imu_safety: true
+    imu_spin_yaw_residual: 2.5
+    imu_spin_hold_time: 0.2
+    imu_spin_min_speed: 1.5
+    imu_steer_lag_time_constant: 0.17
+    imu_collision_accel: 19.0
+    imu_collision_hold_time: 1.0
+
+    # Runtime tire-grip envelope.  Disabled in the common base file so the
+    # simulator and tools retain their prior behavior; run_car.sh enables it.
+    # It observes steering-command versus measured-yaw response, reduces the
+    # limit quickly after sustained slip, and restores it only slowly during
+    # a well-matched corner.  It never edits or saves the raceline CSV.
+    enable_realtime_grip_limit: false
+    grip_limit_initial: 5.0
+    grip_limit_min: 3.5
+    grip_limit_max: 6.6
+    grip_understeer_ratio: 0.82
+    grip_oversteer_ratio: 1.25
+    grip_slip_hold_time: 0.08
+    grip_attack_time_constant: 0.08
+    grip_release_time_constant: 8.0
+    grip_safety_factor: 0.90
+    grip_min_speed: 1.5
+    grip_min_expected_yaw_rate: 0.5
+
+    # The vehicle mux receives autonomous commands on /drive and higher-
+    # priority manual commands on /teleop.  Do not publish MPC commands at all
+    # while the LB/manual stream is alive.  RB stops /teleop, then MPC resumes
+    # only after this timeout (slightly longer than mux.yaml's 0.2 s timeout).
+    enable_manual_override: true
+    manual_override_topic: /teleop
+    manual_override_timeout: 0.25
+
+    # Control rate is DECOUPLED from the model step: the loop replans every
+    # control_period, while each rollout still uses dt=0.05.  This shared file
+    # keeps horizon=25 for simulator/tool experiments; run_car.sh pins the
+    # deadline-validated horizon=15 real-car override. Accelerated rollout
+    # costs support the auto chain
+    # gpu -> cpu -> numpy; run_car defaults to CPU because the on-car particle
+    # filter already owns CUDA, while the simulator may still use GPU.  The
+    # real-car loop executes on each native 49.98 Hz PF odometry callback.
+    # The warm-started antithetic CEM converges by iteration two.  Replaying
+    # mpc_20260822_125258 with its recorded raceline, 160x2 produced solver
+    # p95 4.08 ms and odometry-arrival-to-/drive p95 7.52 ms.  Adding the
+    # latest bag's measured /drive-to-servo p95 1.45 ms gives 8.98 ms end to
+    # end; full obstacle replans remain at 9.83 ms by the same conservative
+    # sum.  One serial fused CPU worker also leaves PF/lidar cores available.
+    # Planner slew and anti-stall are control_period-aware, so their physical
+    # behavior remains rate-independent.  The simulator overrides this with
+    # its separately validated 40 Hz setting in mpc_sim.yaml.
+    control_period: 0.02
+    # PF odometry is the 49.98 Hz control clock.  Execute on message arrival
+    # so state-to-command latency has no extra 0--20 ms timer phase.
+    control_on_odometry: true
+    visualization_period: 0.20
+    horizon: 20
+    dt: 0.05
+    samples: 160
+    iterations: 2
+    elite_fraction: 0.10
+    random_seed: 7
+
+    # F1TENTH kinematic bicycle and actuator limits.  Accel bounds cover the
+    # raceline's +7.4/-8.0 m/s^2 profile within the simulator's a_max of 9.51.
+    # Physical tape-measured rear-axle to front-axle distance.  Steering
+    # commands are converted separately to physical wheel angle, so wheelbase
+    # must never be shortened to absorb servo calibration.
+    wheelbase: 0.325
+    # 2026-08-24 recalibration (bags mpc_20260824_002320/_002707): the
+    # composed 0.9130 (= 1.0101 servo * 0.9039 linkage) under-predicted the
+    # measured command->yaw response by 1.20x at every speed band, and the
+    # servo answers in 0.03-0.05 s, not 0.17 s.  That model error was the
+    # corner-entry weaving limit cycle (see scripts/run_car.sh).  ERPM speed
+    # calibration was ruled out (odom/PF distance ratio 1.046).
+    steering_gain: 1.0956
+    # Fitted 0.03-0.05 s; 0.08 keeps margin for a loaded/low-voltage servo
+    # without re-entering the over-lead regime the old 0.17 caused.
+    steering_time_constant: 0.08
+    # COMMAND units - the same number that appears as steering_angle on
+    # /drive and /ackermann_cmd, not a wheel angle.  These match the servo's
+    # full travel after the 2026-08-22 recalibration of
+    # f1tenth_stack/config/vesc.yaml (servo = 1.0101*delta + 0.4848 over
+    # servo_min/max 0.0/1.0): delta -0.48 is servo 0.000 and +0.51 is servo
+    # 1.000 exactly, so nothing the planner picks is clipped by the driver.
+    min_steer: -0.48
+    max_steer: 0.51
+    # The first applied command uses control_period (20 ms), while prediction
+    # steps use dt (50 ms), so this is a true physical rate at 50 Hz.
+    # COMMAND units.  Against the 2026-08-24 gain 1.0956 this is 2.43 rad/s
+    # at the wheel - a smoothness cap at ~55% of the servo's measured ~4.8
+    # rad/s capability, harness-validated with the corrected model.
+    max_steer_rate: 2.218
+    min_accel: -8.5
+    max_accel: 5.0
+    min_speed: 0.0
+    # Matched to the VESC driver's 67000 ERPM ceiling (67000 / 6700 = 10.0 m/s).
+    max_speed: 10.0
+
+    # Full pace of the slower-only, closed-loop-feasible grip profile.
+    speed_scale: 1.0
+    minimum_reference_speed: 1.0
+    max_lateral_accel: 5.2
+    # Keep curvature, steering-reach, and longitudinal feasibility caps active
+    # even though the shipped CSV is already re-profiled. The speed editor
+    # preserves authored values in the CSV; these runtime caps keep a manually
+    # raised corner speed inside the vehicle envelope.
+    reference_speed_caps: true
+    reference_brake_accel: 3.8
+    reference_accel_limit: 5.0
+
+    # Sector speed scaling removed 2026-08-24: per-waypoint speed shaping
+    # lives in the raceline CSV (tools/reprofile_raceline.py can bake
+    # slower-only sectors) plus the runtime feasibility passes, so no
+    # side-channel params file can slow a line silently any more.
+
+    contour_weight: 180.0
+    lag_weight: 2.0
+    heading_weight: 4.0
+    speed_weight: 2.0
+    terminal_weight: 3.0
+    steer_feedforward_weight: 0.7
+    accel_weight: 0.06
+    steer_rate_weight: 8.0
+    accel_rate_weight: 0.03
+
+    initial_steer_std: 0.12
+    initial_accel_std: 2.5
+    minimum_steer_std: 0.012
+    minimum_accel_std: 0.12
+
+    # The simulator tracks speed commands with a proportional controller, so
+    # command the planned speed 0.2 s ahead and pre-propagate the state over
+    # the odometry-to-actuation delay.  solve() advances its prediction-only
+    # steering state over this same delay; pose and rack angle must describe
+    # one instant or the 0.17 s servo phase lag produces a weaving limit cycle.
+    speed_command_preview: 0.20
+    latency_compensation: 0.02
+    # Never let the clear-track optimizer park to reduce contour error in a
+    # tight direction reversal.  A wall-checked Pure-Pursuit/feed-forward
+    # candidate provides deterministic low-speed steering; any relevant
+    # obstacle or follow cap disables this floor.
+    clear_track_speed_floor: 1.6
+    clear_track_lookahead: 0.70
+
+    # Obstacle avoidance: scan-detected obstacles are tracked against the
+    # clean map, avoided with lateral offset lanes, and pushed away from in
+    # the CEM cost.  Walls come from the map distance field.
+    enable_obstacle_avoidance: true
+    laser_offset: 0.275
+    detection_range: 8.0
+    # Scan returns within this distance of a map wall are treated as the wall
+    # itself, not an obstacle.  Must exceed the localization error, or wall
+    # returns become phantom obstacles (the real car needs ~0.35; see
+    # run_car.sh).  0.12 is fine in the sim where localization is exact.
+    wall_filter_margin: 0.12
+    # Preserve returns that actually occupy the driven corridor even when the
+    # real-car wall filter is much wider.  This is essential in tight corners,
+    # where the raceline itself can sit inside the wall-filter band.
+    obstacle_path_keep_distance: 0.30
+    # Do not let that exception resurrect returns on the mapped wall shell.
+    # A real blocker must protrude at least this far into free space before
+    # near-path preservation can bypass wall_filter_margin.
+    obstacle_path_keep_wall_floor: 0.50
+    # Scan filtering/tracking runs on the sensor executor in parallel with
+    # MPC.  Advance mover centres over normal handoff latency, but never
+    # predict an old track indefinitely; a 150 ms lidar gap stops autonomy.
+    obstacle_prediction_max_age: 0.08
+    obstacle_snapshot_timeout: 0.15
+    # Merge only overlapping/near-touching static track discs into an exact
+    # enclosing circle.  Covered obstacle geometry is never discarded;
+    # moving vehicle capsule discs are never merged.
+    obstacle_merge_gap: 0.10
+    # PF pose noise is common-mode motion of all scan clusters, not opponent
+    # velocity.  Keep that correction entirely in the MPC tracker: low beta
+    # damps the derivative and the 1 m/s snap leaves slow/static geometry as
+    # a stationary obstacle (still detected and avoided, never discarded).
+    tracker_velocity_beta: 0.05
+    tracker_static_speed: 1.0
+    ego_disc_offset: 0.145
+    ego_disc_radius: 0.22
+    obstacle_weight: 200.0
+    obstacle_margin: 0.20
+    obstacle_collision_weight: 50000.0
+    wall_weight: 120.0
+    wall_margin: 0.15
+    wall_hard_margin: 0.05
+    wall_collision_weight: 50000.0
+    # The latest real-car bag only needed 0.30-0.40 m on successful straight
+    # passes.  Wider candidates admitted wall fragments across the tight
+    # hairpin and selected an infeasible -0.85 m path at the corner exit.
+    avoid_max_offset: 0.70
+    avoid_offset_step: 0.05
+    # Keep the 5 cm final lane resolution, but evaluate a 20 cm coarse grid
+    # first and refine only the best basin's half-cell.  A material scene change
+    # invalidates the selected lane immediately; otherwise reuse it for at
+    # most 0.12 s (six 50 Hz cycles).  The selected basin is still evaluated
+    # on the 5 cm grid and material obstacle changes invalidate immediately.
+    avoid_coarse_offset_step: 0.20
+    avoid_refine_top_k: 1
+    avoid_replan_period: 0.12
+    avoid_lateral_slew: 1.5
+    # Blend lane changes over longitudinal distance.  This keeps the local path
+    # kinematically meaningful when a corner/follow cap makes speed very low.
+    avoid_transition_distance: 2.5
+    # Avoidance speed recovery: on the tight ifac corridor the achievable
+    # side offset is small, so the old defaults (comfort 0.40, min_factor 0.45,
+    # follow_clear_margin 0.40) pinned the car to a ~0.5 m/s crawl past a cone.
+    # These let it hold ~3.5-4 m/s while the solver's hard clearance cost still
+    # keeps ~0.6 m to the obstacle.  Raise follow_clear_margin toward 0.30 for a
+    # wider following margin behind moving opponents.
+    avoid_comfort_clearance: 0.20
+    avoid_min_speed_factor: 0.75
+    # When the exact front/rear-disc path is safe and at least 35 cm of free
+    # gap remains around the footprint (obstacle clearance + wall clearance),
+    # pass at the raceline speed: no FOLLOW governor and no proximity speed
+    # multiplier.  Geometry is fully checked in the same cycle, so detection
+    # must not inject a one-cycle brake pulse.  Curvature/grip/steering limits
+    # remain active.
+    avoid_full_speed_gap: 0.35
+    avoid_full_speed_confirm_cycles: 1
+    follow_distance: 1.2
+    follow_gain: 2.5
+    follow_clear_margin: 0.15
+    friction_weight: 60.0
+    grip_hard_weight: 0.0
+    # Refit jointly with the corrected steering_gain on mpc_20260824_002320
+    # (the 0.0194 value was compensating for the old low gain).
+    understeer_gradient: 0.0155
+
+    odom_timeout: 0.5
+    maximum_path_distance: 1.5
+    enable_emergency_stop: true
+    emergency_stop_distance: 0.08
+    emergency_stop_angle: 0.20

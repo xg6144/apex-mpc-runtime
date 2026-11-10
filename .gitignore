@@ -1,0 +1,14 @@
+/build/
+/install/
+/log/
+bags/
+*.bag
+*.db3
+*.mcap
+__pycache__/
+*.py[cod]
+*.nb[ci]
+*.egg-info/
+.pytest_cache/
+.venv/
+.env
